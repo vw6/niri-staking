@@ -417,7 +417,13 @@ impl XdgShellHandler for State {
             mapped.set_needs_configure();
 
             let window = mapped.window.clone();
-            self.niri.layout.set_maximized(&window, true);
+            // In stacking mode, maximize the floating window in place. The window is not told it's
+            // maximized, so it requests maximize again to restore; hence the toggle.
+            if self.niri.layout.is_stacking() {
+                self.niri.layout.stacking_toggle_maximize(&window);
+            } else {
+                self.niri.layout.set_maximized(&window, true);
+            }
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
                 InitialConfigureState::NotConfigured {
@@ -470,8 +476,11 @@ impl XdgShellHandler for State {
                         // that's expected: the window remains fullscreen, and we simply remember
                         // that it is now pending maximized.
                         *is_pending_maximized = true;
+                        // In stacking mode, the window opens floating and is maximized on map.
+                        let stacking = self.niri.layout.is_stacking();
                         toplevel.with_pending_state(|state| {
-                            if !state.states.contains(xdg_toplevel::State::Fullscreen) {
+                            if !stacking && !state.states.contains(xdg_toplevel::State::Fullscreen)
+                            {
                                 state.states.set(xdg_toplevel::State::Maximized);
                             }
                         });
@@ -488,6 +497,19 @@ impl XdgShellHandler for State {
         }
     }
 
+    fn minimize_request(&mut self, toplevel: ToplevelSurface) {
+        if let Some((mapped, _)) = self
+            .niri
+            .layout
+            .find_window_and_output(toplevel.wl_surface())
+        {
+            let window = mapped.window.clone();
+            if self.niri.layout.stacking_minimize(&window) {
+                self.niri.queue_redraw_all();
+            }
+        }
+    }
+
     fn unmaximize_request(&mut self, toplevel: ToplevelSurface) {
         if let Some((mapped, _)) = self
             .niri
@@ -499,7 +521,13 @@ impl XdgShellHandler for State {
             mapped.set_needs_configure();
 
             let window = mapped.window.clone();
-            self.niri.layout.set_maximized(&window, false);
+            if self.niri.layout.is_stacking() {
+                if self.niri.layout.is_stacking_maximized(&window) {
+                    self.niri.layout.stacking_toggle_maximize(&window);
+                }
+            } else {
+                self.niri.layout.set_maximized(&window, false);
+            }
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
                 InitialConfigureState::NotConfigured {
@@ -575,7 +603,8 @@ impl XdgShellHandler for State {
                             state.states.unset(xdg_toplevel::State::Maximized);
                         });
 
-                        let is_floating = rules.compute_open_floating(&toplevel);
+                        let is_floating = rules.compute_open_floating(&toplevel)
+                            || self.niri.layout.is_stacking();
                         let configure_width = if is_floating {
                             *floating_width
                         } else if *is_full_width {
@@ -785,7 +814,8 @@ impl XdgShellHandler for State {
                             }
                         });
 
-                        let is_floating = rules.compute_open_floating(&toplevel);
+                        let is_floating = rules.compute_open_floating(&toplevel)
+                            || self.niri.layout.is_stacking();
                         let configure_width = if is_floating {
                             *floating_width
                         } else if *is_full_width {
@@ -1109,7 +1139,8 @@ impl State {
         let mut height = None;
         let mut floating_height = None;
         let is_full_width = rules.open_maximized.unwrap_or(false);
-        let is_floating = rules.compute_open_floating(toplevel);
+        // In stacking mode, all windows open floating.
+        let is_floating = rules.compute_open_floating(toplevel) || self.niri.layout.is_stacking();
 
         // Tell the surface the preferred size and bounds for its likely output.
         let ws = rules
@@ -1133,7 +1164,8 @@ impl State {
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Fullscreen);
                 });
-            } else if is_pending_maximized {
+            } else if is_pending_maximized && !self.niri.layout.is_stacking() {
+                // In stacking mode, the window opens floating and is maximized on map.
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Maximized);
                 });

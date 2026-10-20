@@ -1,3 +1,21 @@
+# niri-staking
+
+niri-staking is a fork of [niri](https://github.com/niri-wm/niri), a scrollable-tiling Wayland compositor.
+The project is inspired by and based on niri, written by Ivan Molodetskikh ([YaLTeR](https://github.com/YaLTeR)).
+All credit for niri itself goes to its author and contributors: <https://github.com/niri-wm/niri>.
+
+niri-staking adds a **stacking mode** that manages windows like Windows does: free floating windows with titlebars, snapping to output edges and corners, maximize and minimize.
+It is a mode that can be toggled at any time, so the scrollable tiling of niri stays available.
+See [Stacking](docs/wiki/Stacking.md) for details.
+
+> [!WARNING]
+> This is a personal project. Support is not guaranteed.
+> Please don't report problems with niri-staking to the niri project.
+
+The rest of this file is the original niri README.
+
+---
+
 <h1 align="center"><img alt="niri" src="https://github.com/user-attachments/assets/07d05cd0-d5dc-4a28-9a35-51bae8f119a0"></h1>
 <p align="center">A scrollable-tiling Wayland compositor.</p>
 <p align="center">

@@ -355,6 +355,10 @@ pub struct Niri {
     /// taking grabs into account is expected, because we pass the information to pointer.motion()
     /// which passes it down through grabs, which decide what to do with it as they see fit.
     pub pointer_contents: PointContents,
+    /// Whether the cursor was set to a resize cursor over a window edge in stacking mode.
+    pub titlebar_edge_cursor: bool,
+    /// Window and time of the last click on a window title, to detect double clicks.
+    pub last_title_click: Option<(Window, Duration)>,
     pub pointer_visibility: PointerVisibility,
     pub pointer_inactivity_timer: Option<RegistrationToken>,
     /// Whether the pointer inactivity timer got reset this event loop iteration.
@@ -2574,6 +2578,8 @@ impl Niri {
             cursor_shape_manager_state,
             dnd_icon: None,
             pointer_contents: PointContents::default(),
+            titlebar_edge_cursor: false,
+            last_title_click: None,
             pointer_visibility: PointerVisibility::Visible,
             pointer_inactivity_timer: None,
             pointer_inactivity_timer_got_reset: false,
@@ -6203,7 +6209,8 @@ impl Niri {
                 if matches!(
                     hit,
                     HitType::Activate {
-                        is_tab_indicator: true
+                        is_tab_indicator: true,
+                        ..
                     }
                 ) {
                     return;

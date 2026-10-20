@@ -99,7 +99,7 @@ impl MoveGrab {
 
                 layout.activate_window(&self.window);
             }
-            GestureState::Move => layout.interactive_move_end(&self.window),
+            GestureState::Move => layout.stacking_move_end(&self.window),
             GestureState::ViewOffset => {
                 layout.view_offset_gesture_end(Some(false));
             }
@@ -116,6 +116,12 @@ impl MoveGrab {
     }
 
     fn begin_move(&mut self, data: &mut State) -> bool {
+        // A maximized or snapped window restores its size once it is actually dragged (rather than
+        // just clicked).
+        data.niri
+            .layout
+            .stacking_unmaximize_for_drag(&self.window, self.start_pos_within_output);
+
         if !data.niri.layout.interactive_move_begin(
             self.window.clone(),
             &self.start_output,

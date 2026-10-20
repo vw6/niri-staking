@@ -12,6 +12,7 @@ layout {
     empty-workspace-above-first
     default-column-display "tabbed"
     background-color "#003300"
+    // stacking
 
     preset-column-widths {
         proportion 0.33333
@@ -561,3 +562,18 @@ layout {
 ```
 
 You can also set the color per-output [in the output config](./Configuration:-Outputs.md#layout-config-overrides).
+
+### `stacking`
+
+<sup>niri-staking</sup>
+
+Start niri in [stacking mode](./Stacking.md), where all windows are floating and have titlebars.
+
+```kdl
+layout {
+    stacking
+}
+```
+
+This only sets the mode at startup.
+Use the `toggle-stacking` action to switch the mode at runtime.

@@ -343,6 +343,7 @@ pub enum Action {
     FocusFloating,
     FocusTiling,
     SwitchFocusBetweenFloatingAndTiling,
+    ToggleStacking,
     #[knuffel(skip)]
     MoveFloatingWindowById {
         id: Option<u64>,
@@ -678,6 +679,7 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::SwitchFocusBetweenFloatingAndTiling {} => {
                 Self::SwitchFocusBetweenFloatingAndTiling
             }
+            niri_ipc::Action::ToggleStacking {} => Self::ToggleStacking,
             niri_ipc::Action::MoveFloatingWindow { id, x, y } => {
                 Self::MoveFloatingWindowById { id, x, y }
             }

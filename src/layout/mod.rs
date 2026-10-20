@@ -79,12 +79,18 @@ pub mod closing_window;
 pub mod floating;
 pub mod focus_ring;
 pub mod insert_hint_element;
+mod minimize;
 pub mod monitor;
 pub mod opening_window;
+pub mod placement;
 pub mod scrolling;
 pub mod shadow;
+pub mod snap;
+mod stacking;
 pub mod tab_indicator;
 pub mod tile;
+pub mod titlebar;
+mod titlebar_icon;
 pub mod workspace;
 
 #[cfg(test)]
@@ -241,6 +247,9 @@ pub trait LayoutElement {
     fn set_activated(&mut self, active: bool);
     fn set_active_in_column(&mut self, active: bool);
     fn set_floating(&mut self, floating: bool);
+    /// Sets whether the window is maximized or snapped in stacking mode, and should therefore
+    /// draw itself as tiled.
+    fn set_stacking_tiled(&mut self, _tiled: bool) {}
     fn set_bounds(&self, bounds: Size<i32, Logical>);
     fn is_ignoring_opacity_window_rule(&self) -> bool;
 
@@ -320,6 +329,16 @@ pub trait LayoutElement {
 
     fn rules(&self) -> &ResolvedWindowRules;
 
+    /// Window title, shown in the titlebar.
+    fn title(&self) -> Option<String> {
+        None
+    }
+
+    /// Window app ID, used to find the application icon and name.
+    fn app_id(&self) -> Option<String> {
+        None
+    }
+
     /// Runs periodic clean-up tasks.
     fn refresh(&self);
 
@@ -351,6 +370,8 @@ pub struct Layout<W: LayoutElement> {
     last_active_workspace_id: HashMap<String, WorkspaceId>,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
+    /// Whether stacking mode is on.
+    stacking: bool,
     /// Ongoing drag-and-drop operation.
     dnd: Option<DndData<W>>,
     /// Clock for driving animations.
@@ -539,6 +560,8 @@ pub enum HitType {
     Activate {
         /// Whether the hit was on the tab indicator.
         is_tab_indicator: bool,
+        /// Titlebar part that was hit, if any.
+        titlebar: Option<titlebar::TitlebarPart>,
     },
 }
 
@@ -640,6 +663,7 @@ impl HitType {
         match self {
             HitType::Input { .. } => HitType::Activate {
                 is_tab_indicator: false,
+                titlebar: None,
             },
             HitType::Activate { .. } => self,
         }
@@ -698,6 +722,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             interactive_move: None,
+            stacking: options.layout.stacking,
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -723,6 +748,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             interactive_move: None,
+            stacking: opts.layout.stacking,
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -937,6 +963,8 @@ impl<W: LayoutElement> Layout<W> {
     ) -> Option<&Output> {
         let scrolling_height = height.map(SizeChange::from);
         let id = window.id().clone();
+        // In stacking mode, all windows are floating.
+        let is_floating = is_floating || self.stacking;
 
         match &mut self.monitor_set {
             MonitorSet::Normal {
@@ -2840,6 +2868,15 @@ impl<W: LayoutElement> Layout<W> {
 
         for mon in self.monitors_mut() {
             mon.insert_hint = None;
+            // Only reset the snap hint on the output being updated; otherwise updating another
+            // output would restart the hint animation and drop the pending snap target.
+            if output.is_some_and(|out| mon.output() != out) {
+                continue;
+            }
+            for ws in &mut mon.workspaces {
+                ws.snap_hint_prev = ws.snap_hint.take();
+                ws.snap_pending = None;
+            }
         }
 
         if !matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_))) {
@@ -2855,6 +2892,7 @@ impl<W: LayoutElement> Layout<W> {
 
         let _span = tracy_client::span!("Layout::update_insert_hint::update");
 
+        let stacking = self.stacking;
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
             let zoom = mon.overview_zoom();
             let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
@@ -2872,6 +2910,18 @@ impl<W: LayoutElement> Layout<W> {
                     } else {
                         ws.scrolling_insert_position(pos_within_workspace)
                     };
+
+                    // In stacking mode, the hint shows where the window will snap.
+                    let target = (stacking && move_.is_floating)
+                        .then(|| ws.snap_target_at(move_.tile.window().id(), pos_within_workspace))
+                        .flatten();
+                    // A new hint grows out of the dragged window.
+                    let window_rect = Rectangle::new(
+                        (move_.tile_render_location(zoom) - geo.loc).downscale(zoom),
+                        move_.tile.tile_size(),
+                    );
+                    ws.set_snap_hint(target.as_ref().map(|(_, rect)| *rect), window_rect);
+                    ws.snap_pending = target.map(|(target, _)| target);
 
                     let border_width = move_.tile.effective_border_width().unwrap_or(0.);
                     let corner_radius = move_
@@ -2954,7 +3004,10 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
-        self.update_options(Options::from_config(config));
+        let mut options = Options::from_config(config);
+        // Stacking from the config only applies at startup; keep the current mode.
+        options.layout.stacking = self.stacking;
+        self.update_options(options);
     }
 
     fn update_options(&mut self, options: Options) {

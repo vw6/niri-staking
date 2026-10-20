@@ -625,6 +625,9 @@ enum Op {
     FocusFloating,
     FocusTiling,
     SwitchFocusFloatingTiling,
+    ToggleStacking,
+    StackingMinimize(#[proptest(strategy = "1..=5usize")] usize),
+    StackingToggleMaximize(#[proptest(strategy = "1..=5usize")] usize),
     MoveFloatingWindow {
         #[proptest(strategy = "proptest::option::of(1..=5usize)")]
         id: Option<usize>,
@@ -1364,6 +1367,15 @@ impl Op {
             Op::SwitchFocusFloatingTiling => {
                 layout.switch_focus_floating_tiling();
             }
+            Op::ToggleStacking => {
+                layout.toggle_stacking();
+            }
+            Op::StackingMinimize(id) => {
+                layout.stacking_minimize(&id);
+            }
+            Op::StackingToggleMaximize(id) => {
+                layout.stacking_toggle_maximize(&id);
+            }
             Op::MoveFloatingWindow { id, x, y, animate } => {
                 let id = id.filter(|id| layout.has_window(id));
                 layout.move_floating_window(id.as_ref(), x, y, animate);
@@ -1749,6 +1761,7 @@ fn operations_dont_panic() {
         Op::ConsumeOrExpelWindowRight { id: None },
         Op::MoveWorkspaceToOutput(1),
         Op::ToggleColumnTabbedDisplay,
+        Op::ToggleStacking,
     ];
 
     for third in &every_op {
@@ -1928,6 +1941,7 @@ fn operations_from_starting_state_dont_panic() {
         Op::ConsumeOrExpelWindowLeft { id: None },
         Op::ConsumeOrExpelWindowRight { id: None },
         Op::ToggleColumnTabbedDisplay,
+        Op::ToggleStacking,
     ];
 
     for third in &every_op {
@@ -3033,6 +3047,155 @@ fn interactive_move_from_workspace_with_layout_config() {
     ];
 
     check_ops(ops);
+}
+
+fn is_floating(layout: &Layout<TestWindow>, id: usize) -> bool {
+    layout
+        .workspaces()
+        .any(|(_, _, ws)| ws.has_window(&id) && ws.is_floating(&id))
+}
+
+fn stacking_tile(layout: &Layout<TestWindow>, id: usize) -> &Tile<TestWindow> {
+    layout
+        .workspaces()
+        .flat_map(|(_, _, ws)| ws.tiles())
+        .find(|tile| *tile.window().id() == id)
+        .unwrap()
+}
+
+#[test]
+fn stacking_makes_all_windows_floating_and_back() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: Some(2) },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::ToggleStacking,
+    ];
+    let mut layout = check_ops(ops);
+    assert!(layout.is_stacking());
+    for id in 1..=3 {
+        assert!(is_floating(&layout, id));
+    }
+
+    check_ops_on_layout(&mut layout, [Op::ToggleStacking]);
+    assert!(!layout.is_stacking());
+    for id in 1..=3 {
+        assert!(!is_floating(&layout, id));
+    }
+
+    // Windows go back into their original columns.
+    let ws = layout.active_workspace().unwrap();
+    let columns: Vec<Vec<usize>> = ws
+        .scrolling()
+        .columns()
+        .map(|col| col.tiles().map(|(tile, _)| *tile.window().id()).collect())
+        .collect();
+    assert_eq!(columns, [vec![1, 2], vec![3]]);
+}
+
+#[test]
+fn stacking_keeps_floating_windows_floating() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ToggleWindowFloating { id: Some(2) },
+        Op::ToggleStacking,
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+    ];
+    let mut layout = check_ops(ops);
+    assert!(is_floating(&layout, 3));
+
+    check_ops_on_layout(&mut layout, [Op::ToggleStacking]);
+    assert!(!is_floating(&layout, 1));
+    assert!(is_floating(&layout, 2));
+    // Windows opened during stacking go to the scrolling layout.
+    assert!(!is_floating(&layout, 3));
+}
+
+#[test]
+fn stacking_minimize_and_restore() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::StackingMinimize(2),
+    ];
+    // Minimize does nothing outside stacking mode.
+    let mut layout = check_ops(ops);
+    assert!(!stacking_tile(&layout, 2).minimized);
+
+    check_ops_on_layout(&mut layout, [Op::ToggleStacking, Op::StackingMinimize(2)]);
+    assert!(stacking_tile(&layout, 2).minimized);
+    assert_eq!(layout.focus().map(|win| *win.id()), Some(1));
+
+    layout.activate_window(&2);
+    layout.verify_invariants();
+    assert!(!stacking_tile(&layout, 2).minimized);
+    assert_eq!(layout.focus().map(|win| *win.id()), Some(2));
+
+    // Leaving stacking restores minimized windows.
+    check_ops_on_layout(&mut layout, [Op::StackingMinimize(1), Op::ToggleStacking]);
+    assert!(!stacking_tile(&layout, 1).minimized);
+}
+
+#[test]
+fn stacking_minimize_last_window_leaves_no_focus() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::ToggleStacking,
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::StackingMinimize(1),
+    ];
+    let mut layout = check_ops(ops);
+    assert!(layout.focus().is_none());
+
+    layout.activate_window(&1);
+    layout.verify_invariants();
+    assert_eq!(layout.focus().map(|win| *win.id()), Some(1));
+}
+
+#[test]
+fn stacking_maximize_toggles() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::ToggleStacking,
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::StackingToggleMaximize(1),
+    ];
+    let mut layout = check_ops(ops);
+    assert!(layout.is_stacking_maximized(&1));
+
+    check_ops_on_layout(&mut layout, [Op::StackingToggleMaximize(1)]);
+    assert!(!layout.is_stacking_maximized(&1));
+
+    check_ops_on_layout(
+        &mut layout,
+        [Op::StackingToggleMaximize(1), Op::ToggleStacking],
+    );
+    assert!(!layout.is_stacking_maximized(&1));
 }
 
 #[test]

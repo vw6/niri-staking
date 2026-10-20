@@ -2985,6 +2985,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 ) {
                     let hit = HitType::Activate {
                         is_tab_indicator: true,
+                        titlebar: None,
                     };
                     return Some((col.tiles[idx].window(), hit));
                 }
@@ -3668,6 +3669,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             };
 
             for (tile_idx, tile) in col.tiles.iter_mut().enumerate() {
+                tile.titlebar_on = false;
                 let win = tile.window_mut();
 
                 let active_in_column = col.active_tile_idx == tile_idx;

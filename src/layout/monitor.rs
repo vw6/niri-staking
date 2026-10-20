@@ -1736,9 +1736,21 @@ impl<W: LayoutElement> Monitor<W> {
 
             let xray_pos = XrayPos::new(geo.loc, zoom);
 
+            // The snap hint goes above floating windows (but below the dragged window), unlike the
+            // regular insert hint.
+            let snap_hint = ws.snap_hint.is_some();
+            if snap_hint {
+                if let Some(loc) = insert_hint_render_loc {
+                    if loc.workspace == InsertWorkspace::Existing(ws.id()) {
+                        self.insert_hint_element
+                            .render(ctx.renderer, loc.location, push!());
+                    }
+                }
+            }
+
             ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
 
-            if let Some(loc) = insert_hint_render_loc {
+            if let Some(loc) = insert_hint_render_loc.filter(|_| !snap_hint) {
                 if loc.workspace == InsertWorkspace::Existing(ws.id()) {
                     self.insert_hint_element
                         .render(ctx.renderer, loc.location, push!());

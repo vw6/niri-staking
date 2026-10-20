@@ -15,19 +15,21 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Serial, Size, Transform};
 use smithay::wayland::compositor::with_states;
-use smithay::wayland::shell::xdg::SurfaceCachedState;
+use smithay::wayland::shell::xdg::{SurfaceCachedState, XdgToplevelSurfaceData};
 
 use super::floating::{FloatingSpace, FloatingSpaceRenderElement};
+use super::placement;
 use super::scrolling::{
     Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
 };
 use super::shadow::Shadow;
+use super::snap::SnapTarget;
 use super::tile::{Tile, TileRenderSnapshot};
 use super::{
     ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
     RemovedTile, SizeFrac,
 };
-use crate::animation::Clock;
+use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -42,6 +44,8 @@ use crate::utils::{
 };
 use crate::window::ResolvedWindowRules;
 
+mod stacking;
+
 #[derive(Debug)]
 pub struct Workspace<W: LayoutElement> {
     /// The scrollable-tiling layout.
@@ -52,6 +56,18 @@ pub struct Workspace<W: LayoutElement> {
 
     /// Whether the floating layout is active instead of the scrolling layout.
     floating_is_active: FloatingActive,
+
+    /// Snap hint for the window being dragged in stacking mode.
+    pub(super) snap_hint: Option<Rectangle<f64, Logical>>,
+
+    /// Snap hint before the last update, to detect when it changes.
+    pub(super) snap_hint_prev: Option<Rectangle<f64, Logical>>,
+
+    /// Ongoing snap hint animation and the rectangle it started from.
+    pub(super) snap_hint_anim: Option<(Animation, Rectangle<f64, Logical>)>,
+
+    /// Where the window being dragged goes on release, matching `snap_hint`.
+    pub(super) snap_pending: Option<SnapTarget<W::Id>>,
 
     /// The original output of this workspace.
     ///
@@ -257,6 +273,10 @@ impl<W: LayoutElement> Workspace<W> {
             scrolling,
             floating,
             floating_is_active: FloatingActive::No,
+            snap_hint: None,
+            snap_hint_prev: None,
+            snap_hint_anim: None,
+            snap_pending: None,
             original_output,
             scale,
             transform: output.current_transform(),
@@ -321,6 +341,10 @@ impl<W: LayoutElement> Workspace<W> {
             scrolling,
             floating,
             floating_is_active: FloatingActive::No,
+            snap_hint: None,
+            snap_hint_prev: None,
+            snap_hint_anim: None,
+            snap_pending: None,
             output: None,
             scale,
             transform: Transform::Normal,
@@ -368,7 +392,12 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.scrolling.are_animations_ongoing() || self.floating.are_animations_ongoing()
+        self.scrolling.are_animations_ongoing()
+            || self.floating.are_animations_ongoing()
+            || self
+                .snap_hint_anim
+                .as_ref()
+                .is_some_and(|(anim, _)| !anim.is_done())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -618,7 +647,20 @@ impl<W: LayoutElement> Workspace<W> {
                 // If the tile is pending maximized or fullscreen, open it in the scrolling layout
                 // where it can do that.
                 if is_floating && tile.window().pending_sizing_mode().is_normal() {
+                    // In stacking mode, open maximized if the last window of this application
+                    // was closed maximized.
+                    let maximize = self.options.layout.stacking
+                        && tile.floating_pos.is_none()
+                        && tile
+                            .window()
+                            .app_id()
+                            .and_then(|app_id| placement::get(&app_id))
+                            .is_some_and(|p| p.maximized);
+                    let id = tile.window().id().clone();
                     self.floating.add_tile(tile, activate);
+                    if maximize {
+                        self.toggle_stacking_maximize(&id);
+                    }
 
                     if activate || self.scrolling.is_empty() {
                         self.floating_is_active = FloatingActive::Yes;
@@ -863,14 +905,26 @@ impl<W: LayoutElement> Workspace<W> {
             let current = guard.current();
             (current.min_size, current.max_size)
         });
+        let app_id = with_states(toplevel.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().unwrap().app_id.clone())
+        });
         toplevel.with_pending_state(|state| {
             if state.states.contains(xdg_toplevel::State::Fullscreen) {
                 state.size = Some(self.view_size.to_i32_round());
             } else if state.states.contains(xdg_toplevel::State::Maximized) {
                 state.size = Some(self.working_area.size.to_i32_round());
             } else {
-                let size =
+                let mut size =
                     self.new_window_size(width, height, is_floating, rules, (min_size, max_size));
+                // In stacking mode, use the size of the last closed window of this application.
+                if is_floating && self.options.layout.stacking {
+                    if let Some(p) = app_id.as_deref().and_then(placement::get) {
+                        size = Size::from((p.w, p.h));
+                    }
+                }
                 state.size = Some(size);
             }
 
@@ -1865,6 +1919,11 @@ impl<W: LayoutElement> Workspace<W> {
         &self,
         position: InsertPosition,
     ) -> Option<Rectangle<f64, Logical>> {
+        if position == InsertPosition::Floating {
+            if let Some(rect) = self.snap_hint {
+                return Some(self.animated_snap_hint(rect));
+            }
+        }
         self.scrolling.insert_hint_area(position)
     }
 

@@ -148,7 +148,8 @@ impl CompositorHandler for State {
                     // The GTK about dialog sets min/max size after the initial configure but
                     // before mapping, so we need to compute open_floating at the last possible
                     // moment, that is here.
-                    let is_floating = rules.compute_open_floating(toplevel);
+                    let is_floating =
+                        rules.compute_open_floating(toplevel) || self.niri.layout.is_stacking();
 
                     // Figure out if we should activate the window.
                     let activate = rules.open_focused.map(|focus| {
@@ -229,6 +230,12 @@ impl CompositorHandler for State {
                     if let Some((mapped, _)) = self.niri.layout.find_window_and_output(surface) {
                         if mapped.pending_sizing_mode().is_fullscreen() && is_pending_maximized {
                             self.niri.layout.set_maximized(&window, true);
+                        } else if is_pending_maximized
+                            && self.niri.layout.is_stacking()
+                            && !self.niri.layout.is_stacking_maximized(&window)
+                        {
+                            // In stacking mode, maximize the floating window in place.
+                            self.niri.layout.stacking_toggle_maximize(&window);
                         }
                     } else {
                         error!("layout is missing the window that we just added");

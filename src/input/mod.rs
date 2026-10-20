@@ -64,6 +64,7 @@ pub mod scroll_swipe_gesture;
 pub mod scroll_tracker;
 pub mod spatial_movement_grab;
 pub mod swipe_tracker;
+mod titlebar;
 pub mod touch_overview_grab;
 pub mod touch_resize_grab;
 
@@ -2161,6 +2162,10 @@ impl State {
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
+            Action::ToggleStacking => {
+                self.niri.layout.toggle_stacking();
+                self.niri.queue_redraw_all();
+            }
             Action::SwitchFocusBetweenFloatingAndTiling => {
                 self.niri.layout.switch_focus_floating_tiling();
                 self.maybe_warp_cursor_to_focus();
@@ -2579,6 +2584,7 @@ impl State {
 
         self.niri.handle_focus_follows_mouse(&under);
 
+        self.update_titlebar_hover(&under);
         self.niri.pointer_contents.clone_from(&under);
 
         pointer.motion(
@@ -2682,6 +2688,7 @@ impl State {
 
         self.niri.handle_focus_follows_mouse(&under);
 
+        self.update_titlebar_hover(&under);
         self.niri.pointer_contents.clone_from(&under);
 
         pointer.motion(
@@ -2873,6 +2880,13 @@ impl State {
                 }
             }
 
+            if button == Some(MouseButton::Left) && !is_overview_open {
+                let under = self.niri.contents_under(pointer.current_location());
+                if self.on_titlebar_press(button_code, &under) {
+                    return;
+                }
+            }
+
             if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
 
@@ -2967,6 +2981,7 @@ impl State {
                                 .layout
                                 .interactive_resize_begin(window.clone(), edges)
                             {
+                                self.niri.layout.stacking_resize_begin(&window, edges);
                                 let start_data = PointerGrabStartData {
                                     focus: None,
                                     button: button_code,

@@ -96,6 +96,8 @@ pub struct Mapped {
 
     /// Whether this window is floating.
     is_floating: bool,
+    /// Whether this window is maximized or snapped in stacking mode.
+    is_stacking_tiled: bool,
 
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
@@ -289,6 +291,7 @@ impl Mapped {
             is_focused: false,
             is_active_in_column: true,
             is_floating: false,
+            is_stacking_tiled: false,
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
@@ -591,7 +594,13 @@ impl Mapped {
     }
 
     pub fn update_tiled_state(&self, prefer_no_csd: bool) {
-        update_tiled_state(self.toplevel(), prefer_no_csd, self.rules.tiled_state);
+        // Maximized and snapped windows in stacking mode are always tiled, so that they draw
+        // without rounded corners and shadows and line up with their neighbors.
+        let force = self
+            .rules
+            .tiled_state
+            .or(self.is_stacking_tiled.then_some(true));
+        update_tiled_state(self.toplevel(), prefer_no_csd, force);
     }
 
     pub fn is_windowed_fullscreen(&self) -> bool {
@@ -1001,6 +1010,12 @@ impl LayoutElement for Mapped {
         self.need_to_recompute_rules |= changed;
     }
 
+    fn set_stacking_tiled(&mut self, tiled: bool) {
+        let changed = self.is_stacking_tiled != tiled;
+        self.is_stacking_tiled = tiled;
+        self.need_to_recompute_rules |= changed;
+    }
+
     fn set_bounds(&self, bounds: Size<i32, Logical>) {
         self.toplevel().with_pending_state(|state| {
             state.bounds = Some(bounds);
@@ -1356,6 +1371,14 @@ impl LayoutElement for Mapped {
 
     fn rules(&self) -> &ResolvedWindowRules {
         &self.rules
+    }
+
+    fn title(&self) -> Option<String> {
+        with_toplevel_role(self.toplevel(), |role| role.title.clone())
+    }
+
+    fn app_id(&self) -> Option<String> {
+        with_toplevel_role(self.toplevel(), |role| role.app_id.clone())
     }
 
     fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot> {

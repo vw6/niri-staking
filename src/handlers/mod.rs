@@ -13,7 +13,7 @@ use std::time::Duration;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::DrmNode;
 use smithay::backend::input::{InputEvent, TabletToolDescriptor};
-use smithay::desktop::{PopupKind, PopupManager};
+use smithay::desktop::{layer_map_for_output, PopupKind, PopupManager, WindowSurfaceType};
 use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus, PointerHandle};
 use smithay::input::{keyboard, Seat, SeatHandler, SeatState};
@@ -550,6 +550,48 @@ impl ForeignToplevelHandler for State {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             mapped.toplevel().send_close();
         }
+    }
+
+    fn set_minimized(&mut self, wl_surface: WlSurface) {
+        if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
+            let window = mapped.window.clone();
+            self.niri.layout.stacking_minimize(&window);
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    fn set_rectangle(
+        &mut self,
+        wl_surface: WlSurface,
+        panel: WlSurface,
+        rect: Rectangle<i32, Logical>,
+    ) {
+        if rect.is_empty() {
+            return;
+        }
+        // Only use the button when the taskbar is on the same output as the window.
+        let Some((window, Some(output))) = self
+            .niri
+            .layout
+            .find_window_and_output(&wl_surface)
+            .map(|(mapped, output)| (mapped.window.clone(), output.cloned()))
+        else {
+            return;
+        };
+        let map = layer_map_for_output(&output);
+        let Some(layer) = map.layer_for_surface(&panel, WindowSurfaceType::TOPLEVEL) else {
+            return;
+        };
+        let Some(geo) = map.layer_geometry(layer) else {
+            return;
+        };
+        drop(map);
+        let rect = Rectangle::new(geo.loc + rect.loc, rect.size).to_f64();
+        self.niri.layout.set_taskbar_rect(&window, rect);
+    }
+
+    fn unset_minimized(&mut self, wl_surface: WlSurface) {
+        self.activate(wl_surface);
     }
 
     fn set_fullscreen(&mut self, wl_surface: WlSurface, wl_output: Option<WlOutput>) {

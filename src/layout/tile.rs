@@ -9,8 +9,13 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
+use super::minimize::MinimizeAnimation;
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
+use super::scrolling::ColumnWidth;
 use super::shadow::Shadow;
+use super::snap::SnapState;
+use super::titlebar::{caption, edges_at, Titlebar, TitlebarPart, HEIGHT as TITLEBAR_HEIGHT};
+use super::titlebar_icon::app_info;
 use super::{
     HitType, LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot, Options,
     SizeFrac, RESIZE_ANIMATION_THRESHOLD,
@@ -23,6 +28,7 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
+use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -32,8 +38,22 @@ use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
-    baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1,
+    baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1, ResizeEdge,
 };
+
+/// Where a tile was before stacking mode was turned on.
+#[derive(Debug, Clone, Copy)]
+pub enum StackingOrigin {
+    /// In the scrolling layout: column index, index within the column, and column width.
+    Column {
+        col: usize,
+        tile: usize,
+        width: ColumnWidth,
+        is_full_width: bool,
+    },
+    /// In the floating layout.
+    Floating,
+}
 
 /// Toplevel window with decorations.
 #[derive(Debug)]
@@ -61,6 +81,39 @@ pub struct Tile<W: LayoutElement> {
 
     /// Whether the tile should float upon unfullscreening.
     pub(super) restore_to_floating: bool,
+
+    /// Where this tile was before stacking mode was turned on.
+    pub(super) stacking_origin: Option<StackingOrigin>,
+
+    /// Titlebar drawn in stacking mode for windows with server-side decorations.
+    pub(super) titlebar: Titlebar,
+
+    /// Whether the tile is managed by stacking mode (set by the floating space).
+    pub(super) titlebar_on: bool,
+
+    /// Whether the window is active, for the titlebar colors.
+    titlebar_active: bool,
+
+    /// Whether the window is minimized.
+    ///
+    /// Minimized windows are not rendered and receive no input. Activating the window restores it.
+    pub(super) minimized: bool,
+
+    /// Ongoing minimize or restore animation.
+    minimize_animation: Option<MinimizeAnimation>,
+
+    /// Taskbar button of this window in output coordinates, as reported by the taskbar.
+    pub(super) taskbar_rect: Option<Rectangle<f64, Logical>>,
+
+    /// Tile position and window size from before the window was maximized in stacking mode.
+    pub(super) restore_geometry: Option<(Point<f64, Logical>, Size<i32, Logical>)>,
+
+    /// Snapped geometry in stacking mode.
+    pub(super) snap: Option<SnapState>,
+
+    /// Sides of this tile following an ongoing resize of a snapped window, and the tile rectangle
+    /// at the start of the resize.
+    pub(super) snap_follow: Option<(ResizeEdge, Rectangle<f64, Logical>)>,
 
     /// The size that the window should assume when going floating.
     ///
@@ -133,6 +186,7 @@ niri_render_elements! {
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
+        Titlebar = PrimaryGpuTextureRenderElement,
     }
 }
 
@@ -196,6 +250,16 @@ impl<W: LayoutElement> Tile<W> {
             sizing_mode,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
             restore_to_floating: false,
+            stacking_origin: None,
+            titlebar: Titlebar::default(),
+            titlebar_on: false,
+            titlebar_active: false,
+            minimized: false,
+            minimize_animation: None,
+            taskbar_rect: None,
+            restore_geometry: None,
+            snap: None,
+            snap_follow: None,
             floating_window_size: None,
             floating_pos: None,
             floating_preset_width_idx: None,
@@ -404,13 +468,20 @@ impl<W: LayoutElement> Tile<W> {
 
         let window_size = self.window_size();
         let radius = self
-            .window
-            .geometry_corner_radius()
+            .corner_radius()
             .fit_to(window_size.w as f32, window_size.h as f32);
         self.rounded_corner_damage.set_corner_radius(radius);
     }
 
     pub fn advance_animations(&mut self) {
+        if self
+            .minimize_animation
+            .as_ref()
+            .is_some_and(|a| a.is_done())
+        {
+            self.minimize_animation = None;
+        }
+
         if let Some(open) = &mut self.open_animation {
             if open.is_done() {
                 self.open_animation = None;
@@ -446,7 +517,8 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
-        self.open_animation.is_some()
+        self.minimize_animation.is_some()
+            || self.open_animation.is_some()
             || self.resize_animation.is_some()
             || self.move_x_animation.is_some()
             || self.move_y_animation.is_some()
@@ -457,6 +529,7 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
+        self.titlebar_active = is_active;
         let rules = self.window.rules();
         let animated_tile_size = self.animated_tile_size();
         let expanded_progress = self.expanded_progress();
@@ -486,8 +559,7 @@ impl<W: LayoutElement> Tile<W> {
         // Later, when windows get the surface shape protocol with radii, this issue will happen
         // when that changes between animated commits.
         let radius = self
-            .window
-            .geometry_corner_radius()
+            .corner_radius()
             .expanded_by(border_width as f32)
             .scaled_by(1. - expanded_progress as f32);
         self.border.update_render_elements(
@@ -507,8 +579,7 @@ impl<W: LayoutElement> Tile<W> {
         let radius = if self.visual_border_width().is_some() {
             radius
         } else {
-            self.window
-                .geometry_corner_radius()
+            self.corner_radius()
                 .scaled_by(1. - expanded_progress as f32)
         };
         self.shadow.update_render_elements(
@@ -556,6 +627,23 @@ impl<W: LayoutElement> Tile<W> {
         offset += self.interactive_move_offset;
 
         offset
+    }
+
+    /// Starts the minimize (or restore) animation towards (or from) `target`, the taskbar button
+    /// relative to the tile position.
+    pub fn start_minimize_animation(&mut self, minimizing: bool, target: Rectangle<f64, Logical>) {
+        self.open_animation = None;
+        self.minimize_animation = Some(MinimizeAnimation::new(
+            Animation::new(
+                self.clock.clone(),
+                0.,
+                1.,
+                0.,
+                self.options.animations.window_open.anim,
+            ),
+            minimizing,
+            target,
+        ));
     }
 
     pub fn start_open_animation(&mut self) {
@@ -704,6 +792,18 @@ impl<W: LayoutElement> Tile<W> {
         }
     }
 
+    /// Returns the titlebar height if the titlebar is shown.
+    ///
+    /// The titlebar is shown in stacking mode for windows in normal sizing mode that use
+    /// server-side decorations.
+    pub fn titlebar_height(&self) -> Option<f64> {
+        if self.titlebar_on && self.sizing_mode.is_normal() && self.window.has_ssd() {
+            Some(TITLEBAR_HEIGHT)
+        } else {
+            None
+        }
+    }
+
     /// Returns `None` if the border is hidden and `Some(width)` if it should be shown.
     pub fn effective_border_width(&self) -> Option<f64> {
         if !self.sizing_mode.is_normal() {
@@ -752,7 +852,8 @@ impl<W: LayoutElement> Tile<W> {
         // - During animations, the window remains centered within the tile; this is important for
         //   the to/from fullscreen animation.
         loc.x += (target_size.w - window_size.w) / 2.;
-        loc.y += (target_size.h - window_size.h) / 2.;
+        let titlebar = self.titlebar_height().unwrap_or(0.);
+        loc.y += titlebar + (target_size.h - titlebar - window_size.h) / 2.;
 
         // Round to physical pixels.
         loc = loc
@@ -777,6 +878,9 @@ impl<W: LayoutElement> Tile<W> {
             size.w += width * 2.;
             size.h += width * 2.;
         }
+        if let Some(height) = self.titlebar_height() {
+            size.h += height;
+        }
 
         size
     }
@@ -795,6 +899,9 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(width) = self.effective_border_width() {
             size.w += width * 2.;
             size.h += width * 2.;
+        }
+        if let Some(height) = self.titlebar_height() {
+            size.h += height;
         }
 
         size
@@ -881,9 +988,59 @@ impl<W: LayoutElement> Tile<W> {
         activation_region.contains(point)
     }
 
+    /// Returns the titlebar part at `point` in tile coordinates.
+    pub fn titlebar_part_at(&self, point: Point<f64, Logical>) -> Option<TitlebarPart> {
+        let height = self.titlebar_height()?;
+        let border = self.effective_border_width().unwrap_or(0.);
+        let width = self.window_size().w;
+        let (x, y) = (point.x - border, point.y - border);
+        if x < 0. || x >= width || y < 0. || y >= height {
+            return None;
+        }
+        Some(Titlebar::part_at(width, x))
+    }
+
+    /// Returns the window corner radius.
+    ///
+    /// Windows in stacking mode have square corners.
+    pub fn corner_radius(&self) -> CornerRadius {
+        if self.titlebar_on {
+            CornerRadius::default()
+        } else {
+            self.window.geometry_corner_radius()
+        }
+    }
+
+    pub fn is_stacking_maximized(&self) -> bool {
+        self.restore_geometry.is_some()
+    }
+
     pub fn hit(&self, point: Point<f64, Logical>) -> Option<HitType> {
         let offset = self.bob_offset();
         let point = point - offset;
+
+        if self.minimized {
+            return None;
+        }
+
+        // Resize edges in stacking mode. These work for client-side decorated windows too, since
+        // tiled windows (e.g. GTK 4 with prefer-no-csd) don't draw their own resize borders.
+        if self.titlebar_on && self.sizing_mode.is_normal() && self.restore_geometry.is_none() {
+            let edges = edges_at(self.tile_size(), point.x, point.y);
+            if !edges.is_empty() {
+                return Some(HitType::Activate {
+                    is_tab_indicator: false,
+                    titlebar: Some(TitlebarPart::Edge(edges)),
+                });
+            }
+        }
+
+        if let Some(part) = self.titlebar_part_at(point) {
+            return Some(HitType::Activate {
+                is_tab_indicator: false,
+                titlebar: Some(part),
+            });
+        }
 
         if self.is_in_input_region(point) {
             let win_pos = self.buf_loc() + offset;
@@ -891,6 +1048,7 @@ impl<W: LayoutElement> Tile<W> {
         } else if self.is_in_activation_region(point) {
             Some(HitType::Activate {
                 is_tab_indicator: false,
+                titlebar: None,
             })
         } else {
             None
@@ -908,6 +1066,9 @@ impl<W: LayoutElement> Tile<W> {
             let width = self.border.width();
             size.w = f64::max(1., size.w - width * 2.);
             size.h = f64::max(1., size.h - width * 2.);
+        }
+        if let Some(height) = self.titlebar_height() {
+            size.h = f64::max(1., size.h - height);
         }
 
         // The size request has to be i32 unfortunately, due to Wayland. We floor here instead of
@@ -930,10 +1091,11 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn tile_height_for_window_height(&self, size: f64) -> f64 {
+        let titlebar = self.titlebar_height().unwrap_or(0.);
         if self.border.is_off() {
-            size
+            size + titlebar
         } else {
-            size + self.border.width() * 2.
+            size + titlebar + self.border.width() * 2.
         }
     }
 
@@ -946,10 +1108,11 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn window_height_for_tile_height(&self, size: f64) -> f64 {
+        let titlebar = self.titlebar_height().unwrap_or(0.);
         if self.border.is_off() {
-            size
+            size - titlebar
         } else {
-            size - self.border.width() * 2.
+            size - titlebar - self.border.width() * 2.
         }
     }
 
@@ -1070,8 +1233,7 @@ impl<W: LayoutElement> Tile<W> {
         // that submit a full-sized buffer before acking the fullscreen state (Firefox).
         let clip_to_geometry = fullscreen_progress < 1. && rules.clip_to_geometry == Some(true);
         let radius = self
-            .window
-            .geometry_corner_radius()
+            .corner_radius()
             .scaled_by(1. - expanded_progress as f32);
 
         // Popups go on top, whether it's resize or not.
@@ -1083,6 +1245,28 @@ impl<W: LayoutElement> Tile<W> {
             xray_pos,
             &mut |elem| push(elem.into()),
         );
+
+        if self.titlebar_height().is_some() {
+            let border = self.visual_border_width().unwrap_or(0.);
+            let info = self.window.app_id().and_then(|id| app_info(&id));
+            let title = caption(
+                &self.window.title().unwrap_or_default(),
+                info.as_ref().and_then(|i| i.name.as_deref()),
+            );
+            if let Some(elem) = self.titlebar.render(
+                ctx.renderer,
+                location + Point::from((border, border)),
+                animated_window_size.w,
+                self.scale,
+                &title,
+                info.as_ref().and_then(|i| i.icon.as_ref()),
+                self.titlebar_active,
+                self.is_stacking_maximized(),
+                1.,
+            ) {
+                push(elem.into());
+            }
+        }
 
         // If we're resizing, try to render a shader, or a fallback.
         let mut pushed_resize = false;
@@ -1246,8 +1430,7 @@ impl<W: LayoutElement> Tile<W> {
             if fullscreen_progress < 1. && has_border_shader {
                 let border_width = self.visual_border_width().unwrap_or(0.);
                 let radius = self
-                    .window
-                    .geometry_corner_radius()
+                    .corner_radius()
                     .expanded_by(border_width as f32)
                     .scaled_by(1. - expanded_progress as f32);
 
@@ -1324,6 +1507,10 @@ impl<W: LayoutElement> Tile<W> {
     ) {
         let _span = tracy_client::span!("Tile::render");
 
+        if self.minimized && self.minimize_animation.is_none() {
+            return;
+        }
+
         let scale = Scale::from(self.scale);
 
         let tile_alpha = self
@@ -1334,7 +1521,34 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed = false;
         self.window().set_offscreen_data(None);
 
-        if let Some(open) = &self.open_animation {
+        if let Some(minimize) = &self.minimize_animation {
+            let mut ctx = ctx.as_gles();
+            let mut elements = Vec::new();
+            self.render_inner(
+                ctx.r(),
+                Point::new(0., 0.),
+                xray_pos,
+                focus_ring,
+                &mut |elem| elements.push(elem),
+            );
+            match minimize.render(
+                ctx.renderer,
+                &elements,
+                self.animated_tile_size(),
+                location,
+                scale,
+                tile_alpha,
+            ) {
+                Ok((elem, data)) => {
+                    self.window().set_offscreen_data(Some(data));
+                    push(OpeningWindowRenderElement::from(elem).into());
+                }
+                Err(err) => {
+                    warn!("error rendering window minimize animation: {err:?}");
+                }
+            }
+            return;
+        } else if let Some(open) = &self.open_animation {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
             self.render_inner(

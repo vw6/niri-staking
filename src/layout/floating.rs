@@ -9,6 +9,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
+use super::placement::{self, Placement};
 use super::scrolling::ColumnWidth;
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
@@ -29,6 +30,9 @@ use crate::window::ResolvedWindowRules;
 
 /// By how many logical pixels the directional move commands move floating windows.
 pub const DIRECTIONAL_MOVE_PX: f64 = 50.;
+
+/// Offset between cascaded windows in stacking mode, one titlebar height.
+const CASCADE_STEP: f64 = super::titlebar::HEIGHT;
 
 /// Space for floating windows.
 #[derive(Debug)]
@@ -92,11 +96,17 @@ struct Data {
 
     /// Working area used for conversions.
     working_area: Rectangle<f64, Logical>,
+
+    /// Whether the top of the tile must stay within the working area.
+    ///
+    /// Used in stacking mode, where the titlebar at the top is what the window is moved by.
+    keep_top_visible: bool,
 }
 
 impl Data {
     pub fn new<W: LayoutElement>(
         working_area: Rectangle<f64, Logical>,
+        keep_top_visible: bool,
         tile: &Tile<W>,
         logical_pos: Point<f64, Logical>,
     ) -> Self {
@@ -105,6 +115,7 @@ impl Data {
             logical_pos: Point::default(),
             size: Size::default(),
             working_area,
+            keep_top_visible,
         };
         rv.update(tile);
         rv.set_logical_pos(logical_pos);
@@ -153,17 +164,22 @@ impl Data {
             logical_pos.y,
             self.working_area.size.h - self.size.h + max_off_screen_ver,
         );
+        if self.keep_top_visible {
+            // Takes priority over the bottom limit for tiles taller than the working area.
+            logical_pos.y = f64::max(logical_pos.y, 0.);
+        }
         logical_pos += self.working_area.loc;
 
         self.logical_pos = logical_pos;
     }
 
-    pub fn update_config(&mut self, working_area: Rectangle<f64, Logical>) {
-        if self.working_area == working_area {
+    pub fn update_config(&mut self, working_area: Rectangle<f64, Logical>, keep_top_visible: bool) {
+        if self.working_area == working_area && self.keep_top_visible == keep_top_visible {
             return;
         }
 
         self.working_area = working_area;
+        self.keep_top_visible = keep_top_visible;
         self.recompute_logical_pos();
     }
 
@@ -231,7 +247,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         for (tile, data) in zip(&mut self.tiles, &mut self.data) {
             tile.update_config(view_size, scale, options.clone());
             data.update(tile);
-            data.update_config(working_area);
+            data.update_config(working_area, options.layout.stacking);
         }
 
         self.view_size = view_size;
@@ -379,11 +395,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.idx_of(id).is_some()
     }
 
+    /// Returns the active window, unless it is minimized.
+    ///
+    /// When all windows are minimized, nothing has focus.
     pub fn active_window(&self) -> Option<&W> {
         let id = self.active_window_id.as_ref()?;
         self.tiles
             .iter()
-            .find(|tile| tile.window().id() == id)
+            .find(|tile| tile.window().id() == id && !tile.minimized)
             .map(Tile::window)
     }
 
@@ -391,7 +410,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let id = self.active_window_id.as_ref()?;
         self.tiles
             .iter_mut()
-            .find(|tile| tile.window().id() == id)
+            .find(|tile| tile.window().id() == id && !tile.minimized)
             .map(Tile::window_mut)
     }
 
@@ -445,15 +464,93 @@ impl<W: LayoutElement> FloatingSpace<W> {
             }
         }
 
-        let pos = self.stored_or_default_tile_pos(&tile).unwrap_or_else(|| {
-            center_preferring_top_left_in_area(self.working_area, tile.tile_size())
-        });
-
-        let data = Data::new(self.working_area, &tile, pos);
+        let pos = self.new_tile_pos(&tile);
+        let data = Data::new(self.working_area, self.options.layout.stacking, &tile, pos);
         self.data.insert(idx, data);
         self.tiles.insert(idx, tile);
 
         self.bring_up_descendants_of(idx);
+    }
+
+    fn new_tile_pos(&self, tile: &Tile<W>) -> Point<f64, Logical> {
+        let center = || center_preferring_top_left_in_area(self.working_area, tile.tile_size());
+        if !self.options.layout.stacking {
+            return self.stored_or_default_tile_pos(tile).unwrap_or_else(center);
+        }
+
+        // In stacking mode, a new window goes where the last window of its application was closed.
+        let saved = (tile.floating_pos.is_none()
+            && tile.window().pending_sizing_mode().is_normal())
+        .then(|| tile.window().app_id())
+        .flatten()
+        .and_then(|app_id| placement::get(&app_id));
+        match saved {
+            Some(p) => {
+                let pos = self.working_area.loc + Point::from((p.x, p.y));
+                self.free_cascade_pos(pos, tile.tile_size())
+            }
+            None => self
+                .stored_or_default_tile_pos(tile)
+                .unwrap_or_else(|| self.cascade_pos(tile)),
+        }
+    }
+
+    /// Returns the position of a new window in stacking mode.
+    ///
+    /// Dialogs are centered over their parent. Other windows cascade down and to the right from
+    /// the topmost window that is not minimized, maximized or snapped. The first window is
+    /// centered.
+    fn cascade_pos(&self, tile: &Tile<W>) -> Point<f64, Logical> {
+        let size = tile.tile_size();
+        let center = center_preferring_top_left_in_area(self.working_area, size);
+        if !tile.window().pending_sizing_mode().is_normal() {
+            return center;
+        }
+
+        let parent =
+            zip(&self.tiles, &self.data).find(|(t, _)| tile.window().is_child_of(t.window()));
+        if let Some((_, data)) = parent {
+            let pos = data.logical_pos + (data.size.to_point() - size.to_point()).downscale(2.);
+            return self.clamp_within_working_area(pos, size);
+        }
+
+        let base = zip(&self.tiles, &self.data)
+            .find(|(t, _)| !t.minimized && t.snap.is_none() && t.restore_geometry.is_none());
+        let Some((_, data)) = base else {
+            return center;
+        };
+        let step = Point::from((CASCADE_STEP, CASCADE_STEP));
+        self.free_cascade_pos(data.logical_pos + step, size)
+    }
+
+    /// Returns `pos`, or the next cascade step if another tile is already there. When the tile
+    /// does not fit, the cascade restarts from the top left of the working area.
+    fn free_cascade_pos(
+        &self,
+        pos: Point<f64, Logical>,
+        size: Size<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let area = self.working_area;
+        let step = Point::from((CASCADE_STEP, CASCADE_STEP));
+        let fits = |pos: Point<f64, Logical>| {
+            pos.x + size.w <= area.loc.x + area.size.w && pos.y + size.h <= area.loc.y + area.size.h
+        };
+        let taken = |pos: Point<f64, Logical>| {
+            self.data.iter().any(|d| {
+                (d.logical_pos.x - pos.x).abs() < 1. && (d.logical_pos.y - pos.y).abs() < 1.
+            })
+        };
+        let mut pos = pos;
+        for _ in 0..64 {
+            if !fits(pos) {
+                pos = area.loc + step;
+            }
+            if !taken(pos) {
+                break;
+            }
+            pos += step;
+        }
+        pos
     }
 
     pub fn add_tile_above(&mut self, above: &W::Id, mut tile: Tile<W>, activate: bool) {
@@ -525,6 +622,32 @@ impl<W: LayoutElement> FloatingSpace<W> {
             }
         }
 
+        // Remember where this application's window was in stacking mode.
+        if let Some(app_id) = tile
+            .window()
+            .app_id()
+            .filter(|_| self.options.layout.stacking)
+        {
+            let area = self.working_area;
+            let win = tile.window();
+            let current = win.expected_size().unwrap_or_else(|| win.size());
+            let (pos, size, maximized) = match (tile.restore_geometry, tile.snap) {
+                (Some((pos, size)), _) => (pos, size, true),
+                (None, Some(snap)) => (data.logical_pos, snap.restore, false),
+                (None, None) => (data.logical_pos, current, false),
+            };
+            placement::set(
+                &app_id,
+                Placement {
+                    x: pos.x - area.loc.x,
+                    y: pos.y - area.loc.y,
+                    w: size.w,
+                    h: size.h,
+                    maximized,
+                },
+            );
+        }
+
         // Store the floating size if we have one.
         if let Some(size) = tile.window().expected_size() {
             tile.floating_window_size = Some(size);
@@ -575,10 +698,70 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return false;
         };
 
+        // Activating a minimized window restores it.
+        if self.tiles[idx].minimized {
+            let target = self.taskbar_target(idx);
+            self.tiles[idx].minimized = false;
+            self.tiles[idx].start_minimize_animation(false, target);
+        }
         self.raise_window(idx, 0);
         self.active_window_id = Some(id.clone());
         self.bring_up_descendants_of(0);
 
+        true
+    }
+
+    /// Minimizes a window. Focus moves to the topmost window that is not minimized.
+    ///
+    /// Returns `false` if all windows are minimized. The active window then stays set, since the
+    /// floating space always has one while it has tiles, but `active_window()` returns `None`.
+    pub fn minimize_window(&mut self, id: &W::Id) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+        if !self.tiles[idx].minimized {
+            let target = self.taskbar_target(idx);
+            self.tiles[idx].minimized = true;
+            self.tiles[idx].start_minimize_animation(true, target);
+        }
+
+        let next = self
+            .tiles
+            .iter()
+            .find(|t| !t.minimized)
+            .map(|t| t.window().id().clone());
+        match next {
+            Some(next) => {
+                if self.active_window_id.as_ref() == Some(id) {
+                    self.active_window_id = Some(next);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Returns the taskbar button of a tile relative to its position.
+    ///
+    /// Without a reported button, this is a small area at the top of the output above the window.
+    fn taskbar_target(&self, idx: usize) -> Rectangle<f64, Logical> {
+        let pos = self.data[idx].logical_pos;
+        let size = self.data[idx].size;
+        let rect = self.tiles[idx].taskbar_rect.unwrap_or_else(|| {
+            let fallback = Size::from((48., 32.));
+            Rectangle::new(
+                Point::from((pos.x + (size.w - fallback.w) / 2., 0.)),
+                fallback,
+            )
+        });
+        Rectangle::new(rect.loc - pos, rect.size)
+    }
+
+    pub fn set_taskbar_rect(&mut self, id: &W::Id, rect: Rectangle<f64, Logical>) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+        self.tiles[idx].taskbar_rect = Some(rect);
         true
     }
 
@@ -915,6 +1098,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
+    /// Moves a tile without ending the ongoing interactive resize (unlike `move_to()`), so that
+    /// snapped neighbors can follow a resized window.
+    pub fn set_logical_pos_keeping_resize(&mut self, id: &W::Id, pos: Point<f64, Logical>) {
+        if let Some(idx) = self.idx_of(id) {
+            self.data[idx].set_logical_pos(pos);
+        }
+    }
+
     fn move_to(&mut self, idx: usize, new_pos: Point<f64, Logical>, animate: bool) {
         if animate {
             self.move_and_animate(idx, new_pos);
@@ -1164,7 +1355,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
         let active = self.active_window_id.clone();
         for tile in &mut self.tiles {
+            let stacking = self.options.layout.stacking;
+            tile.titlebar_on = stacking;
+            let tiled = stacking && (tile.snap.is_some() || tile.restore_geometry.is_some());
             let win = tile.window_mut();
+            win.set_stacking_tiled(tiled);
 
             win.set_active_in_column(true);
             win.set_floating(true);
@@ -1361,7 +1556,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
             let mut data2 = *data;
             data2.update(tile);
-            data2.update_config(self.working_area);
+            data2.update_config(self.working_area, self.options.layout.stacking);
             assert_eq!(data, &data2, "tile data must be up to date");
 
             for tile_below in &self.tiles[i + 1..] {
